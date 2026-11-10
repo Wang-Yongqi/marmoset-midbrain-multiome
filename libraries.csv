@@ -1,0 +1,3 @@
+fastqs,sample,library_type
+/path/to/ivy_rxn2/rna/fastq,2022-03-24_SN_ivy_sl8_rxn2,Gene Expression
+/path/to/ivy_rxn2/atac/fastq,2022-03-24_SN_ivy_sl8_rxn2,Chromatin Accessibility
