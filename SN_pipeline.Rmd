@@ -1,0 +1,290 @@
+---
+title: "Marmoset midbrain single-nucleus multiome workflow"
+author: "Yongqi Wang"
+output: html_document
+params:
+  rxn1_outs: "inputs/ivy_rxn1/outs"
+  rxn2_outs: "inputs/ivy_rxn2/outs"
+  annotation_gff: "inputs/cj1700.gff"
+  tss_bed: "tss.bed"
+  output_rds: "results/merged_SN_ivy.rds"
+---
+
+This notebook prepares and integrates the RNA and ATAC profiles from two
+10x Multiome reactions from one marmoset ventral midbrain specimen.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Signac)
+library(Seurat)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(S4Vectors)
+
+outs_list <- c(ivy1 = params$rxn1_outs, ivy2 = params$rxn2_outs)
+arc_files <- c(
+  "filtered_feature_bc_matrix.h5",
+  "atac_peaks.bed",
+  "atac_fragments.tsv.gz",
+  "atac_fragments.tsv.gz.tbi"
+)
+required_files <- c(
+  params$annotation_gff, params$tss_bed,
+  unlist(lapply(outs_list, file.path, arc_files), use.names = FALSE)
+)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files)) {
+  stop("Missing inputs:\n", paste(missing_files, collapse = "\n"), call. = FALSE)
+}
+```
+
+## Reference annotation
+
+```{r annotation}
+#get annotation
+#Use marmoset NCBI GFF for gene annotation since it contains gene_biotype
+
+annotation <- rtracklayer::import(params$annotation_gff, format = "gff3")
+meta_GR = mcols(annotation)
+mcols(annotation) <- NULL
+mcols(annotation) <- cbind( meta_GR, DataFrame(
+  tx_id = meta_GR$transcript_id,
+  gene_name = meta_GR$Name,
+  gene_id = meta_GR$gene
+))
+##rename gene annotation chromosome names: change dash and colons to dots
+newnames = seqlevels(annotation)
+newnames = gsub("_", ".", newnames)
+newnames = gsub(":", ".", newnames)
+newnames = gsub("-", ".", newnames)
+names(newnames) = seqlevels(annotation)
+annotation = renameSeqlevels(annotation, newnames)
+cat(sprintf("Done creating annotation GR ranges object\n"))
+
+#load in tss bed
+tss <- rtracklayer::import(params$tss_bed, format = "bed")
+
+```
+
+
+#helper functions to process each multiome reaction
+```{r}
+# Build an RNA-only Seurat object from a 10x Multiome outs/ folder
+create_rna_object <- function(outs, name = "") {
+  counts <- Read10X_h5(file.path(outs, "filtered_feature_bc_matrix.h5"))
+  obj <- CreateSeuratObject(counts = counts$`Gene Expression`, assay = "RNA")
+  cat(sprintf("Done creating Seurat object %s: %dx%d\n", name, nrow(obj[["RNA"]]), ncol(obj[["RNA"]])))
+  obj
+}
+
+# RNA QC: drop low-count nuclei, then remove doublets with scDblFinder
+filter_rna_qc <- function(obj, min_nCount_RNA = 1000) {
+  obj <- subset(obj, subset = nCount_RNA > min_nCount_RNA)
+  doub <- scDblFinder::scDblFinder(obj[["RNA"]]$counts, verbose = TRUE)
+  obj <- AddMetaData(obj, as.data.frame(SummarizedExperiment::colData(doub)))
+  subset(obj, subset = (scDblFinder.class == "singlet"))
+}
+
+# Read the cellranger-arc peak bed of one reaction as GRanges
+read_peaks_bed <- function(outs) {
+  peaks <- read.table(file.path(outs, "atac_peaks.bed"), col.names = c("chr", "start", "end"))
+  makeGRangesFromDataFrame(peaks)
+}
+
+# Unified peak set across reactions.
+# disjoin slices peaks so that every peak appearing in each rxn can still be represented
+build_combined_peaks <- function(outs_list, min_width = 20, max_width = 10000) {
+  combined <- disjoin(do.call(c, unname(lapply(outs_list, read_peaks_bed))))
+  w <- width(combined)
+  combined <- combined[w < max_width & w > min_width]
+  #filter out irregular chromosomes (starting with chrUn or ending with random)
+  keepStandardChromosomes(combined, pruning.mode = "tidy")
+}
+
+# Quantify the unified peaks, add the ATAC assay, run ATAC QC and normalize both assays
+add_peaks_assay <- function(obj, outs, peaks, annotation, tss = NULL,
+                            min_nCount_peaks = 1000, max_nCount_peaks = 100000,
+                            max_nucleosome_signal = 2) {
+  frag <- CreateFragmentObject(
+    path = file.path(outs, "atac_fragments.tsv.gz"),
+    cells = colnames(obj)
+  )
+  peak_counts <- FeatureMatrix(fragments = frag, features = peaks, cells = colnames(obj))
+  obj[["peaks"]] <- CreateChromatinAssay(peak_counts, fragments = frag, annotation = annotation)
+
+  DefaultAssay(obj) <- "peaks"
+  if (!is.null(tss)) obj <- TSSEnrichment(obj, tss.positions = tss)
+  obj <- NucleosomeSignal(obj)
+  obj <- subset(obj, subset = nCount_peaks < max_nCount_peaks &
+                  nCount_peaks > min_nCount_peaks &
+                  nucleosome_signal < max_nucleosome_signal)
+
+  DefaultAssay(obj) <- "RNA"
+  obj <- NormalizeData(obj)
+  DefaultAssay(obj) <- "peaks"
+  NormalizeData(obj)
+}
+```
+
+#first create Seurat objects based on RNAseq data and run RNA QC
+```{r}
+ivy_list <- Map(create_rna_object, outs_list, names(outs_list))
+
+#use RNA counts to QC
+hist(ivy_list$ivy1@meta.data[["nCount_RNA"]], main = "Histogram of nCount_RNA", xlab = "nCount_RNA", xlim = c(0, 40000), breaks = 10000)
+
+ivy_list <- lapply(ivy_list, filter_rna_qc)
+```
+
+#unify the ATAC peaks, then add peak assays, QC and normalize each dataset
+```{r}
+combined.peaks <- build_combined_peaks(outs_list)
+combined.peaks
+
+ivy_list <- Map(add_peaks_assay, ivy_list, outs_list,
+                MoreArgs = list(peaks = combined.peaks, annotation = annotation, tss = tss))
+
+#use peaks data to inspect QC
+hist(ivy_list$ivy1@meta.data[["nucleosome_signal"]], main = "Histogram of nucleosome_signal", xlab = "nucleosome_signal", xlim = c(0, 3), breaks = 10000)
+```
+
+#merge
+```{r}
+for (nm in names(ivy_list)) ivy_list[[nm]]$dataset <- nm
+
+# Merge the two reactions and preserve their original cell ID prefixes.
+SN.ivy <- merge(ivy_list$ivy1, ivy_list$ivy2, add.cell.ids = c("1", "2"))
+```
+
+
+
+```{r}
+DefaultAssay(SN.ivy) <- "RNA"
+SN.ivy <- SCTransform(SN.ivy)
+SN.ivy <- RunPCA(SN.ivy)
+DefaultAssay(SN.ivy) <- "peaks"
+SN.ivy <- FindTopFeatures(SN.ivy, min.cutoff = 5)
+SN.ivy <- RunTFIDF(SN.ivy)
+SN.ivy <- RunSVD(SN.ivy)
+
+#visualize in UMAP
+#try joint UMAP (RNA+ATAC)
+SN.ivy <- FindMultiModalNeighbors(
+  object = SN.ivy,
+  reduction.list = list("pca", "lsi"),
+  dims.list = list(1:50, 2:40),
+  modality.weight.name = "RNA.weight",
+  verbose = TRUE
+)
+SN.ivy <- FindClusters(object = SN.ivy, verbose = TRUE, algorithm = 3, resolution = 0.5, graph.name = "wsnn")
+SN.ivy <- RunUMAP(
+  object = SN.ivy,
+  nn.name = "weighted.nn",
+  assay = "RNA",
+  verbose = TRUE
+)
+DimPlot(SN.ivy, label = TRUE, repel = TRUE, group.by = "wsnn_res.0.5", reduction = "umap") + NoLegend()
+
+DimPlot(SN.ivy, group.by = "dataset", label = TRUE, reduction = "umap")
+dir.create(dirname(params$output_rds), recursive = TRUE, showWarnings = FALSE)
+saveRDS(SN.ivy, file = params$output_rds)
+```
+
+
+```{r}
+DefaultAssay(SN.ivy) <- "SCT"
+FeaturePlot(
+  object = SN.ivy,
+  features = c('MBP', 'CSPG4', 'GFAP', 'TMEM119'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+
+```{r}
+FeaturePlot(
+  object = SN.ivy,
+  features = c('RBFOX3', 'SLC17A7', 'GAD1', 'GAD2'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+FeaturePlot(
+  object = SN.ivy,
+  features = c('SLC17A6', 'GLS2', 'GRIN1'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+DefaultAssay(SN.ivy) <- "SCT"
+#Neuroepithelial cells markers
+FeaturePlot(
+  object = SN.ivy,
+  features = c('PAX6', 'NOTCH1', 'PCNA', 'HES5'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+FeaturePlot(
+  object = SN.ivy,
+  features = c('VIM', 'NES', 'SOX2', 'CDH2'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+FeaturePlot(
+  object = SN.ivy,
+  features = c('DCX', 'NEUROD1', 'TBR1', 'NCAM1'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+FeaturePlot(
+  object = SN.ivy,
+  features = c('TH', 'NR4A2', 'SLC6A3', 'FOXA2','GIRK2', 'LMX1B'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+DefaultAssay(SN.ivy) <- "SCT"
+#Serotonergic neurons
+FeaturePlot(
+  object = SN.ivy,
+  features = c('TPH1', 'SLC6A4', 'FEV'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
+```{r}
+#Cholinergic neurons
+FeaturePlot(
+  object = SN.ivy,
+  features = c('CHAT', 'SLC18A3', 'ACHE'),
+  pt.size = 0.5,
+  max.cutoff = 'q95',
+  reduction = 'umap',
+  ncol = 2
+)
+```
