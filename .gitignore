@@ -1,0 +1,10 @@
+.Rhistory
+.RData
+.Rproj.user/
+inputs/
+results/
+SN_ivy_sl8_rxn*/
+SN_pipeline.html
+SN_pipeline_files/
+slurm-*.out
+slurm-*.err
